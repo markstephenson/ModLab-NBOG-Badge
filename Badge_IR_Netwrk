@@ -1,0 +1,313 @@
+/**************************************************************************************
+*
+* FileName...:
+* Description:
+* Target........: Arduino IDE
+* Author.......:
+* Version.....:
+* Date.........:
+* Project......:
+* Contact.....:
+* License.....:
+* Keywords...:
+* History.......:
+*
+Libraries:
+* LED https://code.google.com/p/led-library/
+* SoftPWM
+* PinChangeInt
+use buttons tro trigger:
+- specific colour transitions
+- pulsating
+- sonar effect (pinnnnng pinnnnng)
+
+Colour Usage:
+- Red for effor
+- Green for transmission complete
+***************************************************************************************/
+
+
+
+
+#include <ColorLamp.h>
+#include <PinChangeInt.h>
+#include <SoftPWM.h>
+
+#define LED 4 // non PWM
+
+#define recieveIR 2
+#define transmitIR 3
+
+#define analogPower A5
+#define lightSensor A4
+#define soundSensor A3
+
+#define buttonA 6
+#define buttonB 5
+#define buttonBoy 9
+#define buttonGirl 7
+#define buttonUp 8
+#define buttonDown 11
+#define buttonLeft 12
+#define buttonRight 10
+
+
+#include <IRremote.h>
+IRrecv irrecv(recieveIR);
+decode_results results;
+IRsend irsend;
+
+
+
+
+SOFTPWM_DEFINE_CHANNEL( 0, DDRD, PORTD, PORTD4 );
+SOFTPWM_DEFINE_CHANNEL( 1, DDRC, PORTC, PORTC0 ); // A0
+SOFTPWM_DEFINE_CHANNEL( 2, DDRC, PORTC, PORTC1 ); // A1
+SOFTPWM_DEFINE_CHANNEL( 3, DDRC, PORTC, PORTC2 ); // A2
+SOFTPWM_DEFINE_OBJECT_WITH_BRIGHTNESS_LEVELS( 4, 255 );
+
+//SOFTPWM_DEFINE_OBJECT_WITH_BRIGHTNESS_LEVELS( 4, 255 );
+
+/** Create an RGB lamp on pins 9, 10 and 11. Unless specified otherwise (by adding a 'false' parameter) this will automatically write values to these arduino pins. **/
+ColorLamp * lamp = new ColorLamp(A2,A1,A0, false);
+
+// Or create an Array of LEDs
+// ColorLamp * lamps[10];
+
+boolean isCommunicating = false;
+boolean isSeeking = false;
+boolean isError = false;
+int heartPump = 0;
+
+
+
+unsigned int deviceAddress = 100; //  9 bits for address, range 0-511 
+byte deviceStatus = 123;  // 8 bits for status, range 0 -255
+byte deviceCommand = 99; // 8 bits for command, range 0-255
+unsigned int  rxDeviceAddress = 0;
+byte rxDeviceStatus = 0; 
+byte rxDeviceCommand = 0;
+
+
+int pingDelay = 3000; // every 2 seconds
+unsigned long lastPingMillis = 0;
+
+void setup()
+{
+
+  lamp->intensityTo( 255, 1000 ); // Make sure the light is turned on so we can see what is happening
+  lamp->saturationTo( 255, 1000 ); // make sure we can see Hue changes
+  
+  // setup buttons as input and pullup
+    for (int pin = 5; pin <13; pin++)
+      {
+      pinMode(pin, INPUT);
+      digitalWrite(pin, HIGH);
+      }
+
+    // enable analog power
+    pinMode(analogPower, OUTPUT);
+    digitalWrite(analogPower, HIGH);
+    
+   // Attach functions to Buttons
+   PCintPort::attachInterrupt (buttonA, &buttonAfunction, FALLING);
+   PCintPort::attachInterrupt (buttonB, &buttonBfunction, FALLING);
+   PCintPort::attachInterrupt (buttonBoy, &buttonBoyfunction, FALLING);
+   PCintPort::attachInterrupt (buttonGirl, &buttonGirlfunction, FALLING);
+   PCintPort::attachInterrupt (buttonDown, &buttonDownfunction, FALLING);
+
+
+   Serial.begin(9600);
+   Serial.println("Hello Computer");
+    irrecv.enableIRIn(); // Start the receiver    
+   SoftPWM.begin( 60 ); // 60Hz base freq
+}
+
+
+
+
+unsigned long constructPacket (void) 
+{
+  unsigned long pingConstruct = 0; 
+  deviceAddress = (deviceAddress & 511); // trim to 9 bits
+  pingConstruct = ((unsigned long) deviceAddress << 23) | ((unsigned long)deviceStatus << 15) | ((unsigned long)deviceCommand << 7) ; // address.9 status.8 command.8 spare.2 errsum.5
+
+  byte popCount = 0; // for error checking - hamming weight
+  unsigned long hammingTemp = pingConstruct; 
+  for (popCount; hammingTemp; popCount++)  {  hammingTemp &= hammingTemp - 1; }   // compute Hamming weight
+
+  pingConstruct |= popCount;   // add in Hamming weight error check
+  return pingConstruct; // return packet
+}
+
+boolean deConstructPacket (unsigned long rxPacket) 
+{
+  // clear receive variables
+  rxDeviceAddress = 0;
+  rxDeviceStatus = 0; 
+  rxDeviceCommand = 0;
+  
+  byte rxPopCount = rxPacket & 31;   // split hamming weight off to check error // 0x1F // 0b1 1111
+  rxPacket = rxPacket & 0xFFFFFFE0; // clear hamming weight (bottom 5 bits) // 0b1111 1111 1111 1111 1111 1111 1110 0000
+  
+  byte popCount = 0; // for error checking - hamming weight
+  unsigned long hammingTemp = rxPacket; 
+  for (popCount; hammingTemp; popCount++)  {  hammingTemp &= hammingTemp - 1; }   // compute Hamming weight
+
+  if (rxPopCount != popCount) { return 0;} // return false - error check failed
+  else // must be true - therefore decosntruct packet and return true
+  {
+  rxDeviceAddress = ((unsigned long)(rxPacket & 0xFF800000) >>23); // 0b1111 1111 1000 0000 0000 0000 0000 0000
+  rxDeviceStatus = ((unsigned long)(rxPacket & 0x7F8000) >>15); // 0b0000 0000 0111 1111 1000 0000 0000 0000
+  rxDeviceCommand  = ((unsigned long)(rxPacket & 0x7F80) >>7); // 0b0000 0000 0000 0000 0111 1111 1000 0000  
+  return 1; // return true - error check passed
+  }
+}
+
+
+
+
+
+void loop()
+{
+
+    if (irrecv.decode(&results)) {
+   if (deConstructPacket(results.value)) // we have received good data
+   {
+   // display the rx data
+   Serial.print("Address: ");
+   Serial.print(rxDeviceAddress);
+   Serial.print("  Status: ");
+   Serial.print(rxDeviceStatus);
+   Serial.print("  Command: ");
+   Serial.println(rxDeviceCommand);
+   
+   // now do something
+   SoftPWM.set( 1, rxDeviceStatus);
+  SoftPWM.set( 2, rxDeviceCommand);
+  SoftPWM.set( 3, rxDeviceAddress); // 9 bit - overflow
+
+   }
+   else {Serial.println("bad data");}
+   
+  irrecv.resume(); // Receive the next value
+  }
+  
+  // check the time and ping if great than delay (3000)
+  if ((millis() - lastPingMillis) > pingDelay) 
+  {
+    SoftPWM.set( 0, 128);  // turn on shield led 
+    // ping now
+    irsend.sendNEC(constructPacket(), 32); // Send 32 bits by NEC protocol
+    irrecv.enableIRIn(); // reStart the receiver    
+   
+    // change command and status for fun
+    deviceStatus += 64;
+    deviceCommand += 32;
+   
+    lastPingMillis = millis(); // capture time for next
+    SoftPWM.set( 0, 0);  // turn off shield led     
+  }
+  
+  
+  
+  
+  /*
+  if (isCommunicating) {
+    if( !lamp->isAnimating()) // Returns true if the LED is in an animation
+    {
+      if (heartPump == 2) {
+        delay(1000);
+        heartPump = 0;
+      }
+      else if (lamp->getIntensity() == 10) // Returns the current intensity of the LED
+      {
+        lamp->intensityTo( 255, 500 ); // Sets the desired LED value and the time (in millis) it should take to get there
+      }
+      else {
+        lamp->intensityTo( 10, 500 );
+        heartPump++;
+      }
+    }
+  }
+  
+  
+  if (isSeeking) {
+    if( !lamp->isAnimating()) // Returns true if the LED is in an animation
+    {
+      if (lamp->getIntensity() == 0) // Returns the current intensity of the LED
+      {
+        lamp->intensityTo( 255, 300 ); // Sets the desired LED value and the time (in millis) it should take to get there
+      }
+      else {
+        lamp->intensityTo( 0, 2500 );
+      }
+    }
+  }
+  
+ 
+//You may also use these functions
+//hsbTo( 255, 255, 255, 2000 ); // byte h, byte s, byte b, long duration
+//rgbTo( 255, 255, 255, 2000 ); // byte r, byte g, byte b, long duration
+
+ 
+  // Always call the update function; if autoWrite is on, the Arduino will write the current intensity to the set channel
+  lamp->update();
+  
+  SoftPWM.set( 1, lamp->getRed() );
+  SoftPWM.set( 2, lamp->getGreen() );
+  SoftPWM.set( 3, lamp->getBlue() );
+*/
+}
+
+
+void setColor (unsigned char red, unsigned char green, unsigned char blue) {
+  SoftPWM.set( 1, red);
+  SoftPWM.set( 2, green);
+  SoftPWM.set( 3, blue);
+}
+
+
+void buttonAfunction(void)
+{
+   Serial.println("Button A pushed");
+   lamp->rgbTo( 255, 0, 0, 2000 );
+
+}
+  
+  
+void buttonBfunction(void)
+{
+  // set colour to pink
+  Serial.println("Button B pushed");
+  lamp->rgbTo( 255, 255, 0, 2000 );
+  
+}
+
+void buttonBoyfunction(void)
+{
+  Serial.println("Button Boy pushed - Simulate Commications State - Heart");
+  lamp->rgbTo( 252, 117, 50, 1000 );
+  //lamp->hsbTo( 300, 71, 100, 1000 );
+  lamp->setAnimationType( QUADRATIC, true, true);
+  isCommunicating = !isCommunicating;
+  isSeeking = false;
+}
+
+
+void buttonGirlfunction(void)
+{
+  Serial.println("Button Girl pushed - Simulate Seeking State - Sonar");
+  lamp->rgbTo( 50, 255, 0, 2000 );
+  lamp->setAnimationType( QUADRATIC, false, true);
+  isSeeking = !isSeeking;
+  isCommunicating = false;
+}
+
+void buttonDownfunction(void)
+{
+  Serial.println("Simulate Error - Flashing Red");
+  lamp->rgbTo( 255, 255, 0, 2000 );
+  lamp->setAnimationType( QUADRATIC, false, true);
+  isSeeking = !isSeeking;
+}
